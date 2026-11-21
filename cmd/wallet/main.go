@@ -9,10 +9,25 @@ import (
 	"os/signal"
 	"syscall"
 	"time"
+
+	"github.com/git-blah/payments/internal/platform/postgres"
 )
 
 func main() {
 	logger := slog.New(slog.NewTextHandler(os.Stdout, nil))
+
+	// dsn = data source name
+	dsn := os.Getenv("WALLET_DATABASE_URL")
+	if dsn == "" {
+		// Local development default: the wallet in docker compose
+		dsn = "postgres://payments:payments@localhost:5432/wallet?sslmode=disable"
+	}
+	pool, err := postgres.NewPool(context.Background(), dsn)
+	if err != nil {
+		logger.Error("connect to postgres", "err", err)
+		os.Exit(1)
+	}
+	logger.Info("connected to postgres", "max_conns", pool.Config().MaxConns)
 
 	mux := http.NewServeMux()
 	mux.HandleFunc(
@@ -23,6 +38,21 @@ func main() {
 			w.Write([]byte(`{"status":"ok"}` + "\n"))
 		},
 	)
+
+	mux.HandleFunc(
+		"GET /readyz",
+		func(w http.ResponseWriter, r *http.Request) {
+			ctx, cancel := context.WithTimeout(r.Context(), 2*time.Second)
+			defer cancel()
+			w.Header().Set("Content-Type", "application/json")
+			if err := pool.Ping(ctx); err != nil {
+				logger.Warn("not ready: databse unreachable", "err", err)
+				w.WriteHeader(http.StatusServiceUnavailable)
+				w.Write([]byte(`{"status":"unavailable"}` + "\n"))
+				return
+			}
+			w.Write([]byte(`{"status":"ready"}` + "\n"))
+		})
 
 	srv := &http.Server{
 		Addr:              ":8081",
@@ -53,4 +83,8 @@ func main() {
 		logger.Error("shutdown failed", "err", err)
 	}
 	logger.Info("server stopped")
+
+	// Close the pool last: requests that were still finishing needed it. Shutting down in reverse order of starting
+	pool.Close()
+	logger.Info("database pool closed")
 }
